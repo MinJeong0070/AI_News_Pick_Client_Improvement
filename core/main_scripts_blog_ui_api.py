@@ -27,7 +27,10 @@ def find_original_article_api(index, row_dict, total_count, output_dir, stop_eve
         content = clean_text(str(row_dict.get("게시글내용", "")))
         press = clean_text(str(row_dict.get("검색어", "")))
         first, second, last = extract_first_sentences(content)
-        queries = generate_search_queries(title, first, second, last, press)
+        queries = generate_search_queries(
+            title, first, second, last, press,
+            full_content=content
+        )
         log(f"🔍 검색어: {queries}", index)
 
         # 检查中断
@@ -59,10 +62,14 @@ def find_original_article_api(index, row_dict, total_count, output_dir, stop_eve
         body_with_newline = best["body"]
 
         if score >= 0.0:
-            safe_title = re.sub(r'[\\/*?:"<>|]', '', title)[:50]
-            filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_title}.txt")
+            used_query = best.get("query", "")
+            safe_query = re.sub(r'[\\/*?:"<>|]', '', used_query).strip()[:100]
+            if not safe_query:
+                safe_query = "검색어 없음"
+            # safe_title = re.sub(r'[\\/*?:"<>|]', '', title)[:50]
+            filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_query}.txt")
             with open(filename, "w", encoding="utf-8", errors="replace") as f:
-                f.write(f"[URL] {best['link']}\n\n{body_with_newline}")
+                f.write(f"[검색어] {used_query}\n[URL] {best['link']}\n\n{body_with_newline}")
             log(f"📝 저장 완료 → {filename} (복사율: {score})", index)
             hyperlink = f'=HYPERLINK("{best["link"]}")'
             return index, hyperlink, tfidf_score, body_with_newline, score, exact

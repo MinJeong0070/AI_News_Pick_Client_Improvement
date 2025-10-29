@@ -1,5 +1,6 @@
 import os
 import re
+import stat
 import time
 import logging
 import urllib.parse
@@ -203,20 +204,71 @@ def extract_first_sentences(text):
 
 MAX_QUERY_LENGTH = 100
 
-def generate_search_queries(title, first, second, last, press):
-    """제목/문장/키워드 조합으로 최대 5개 검색쿼리 생성"""
-    def tr(x): return (x or "")[:MAX_QUERY_LENGTH]
-    title_clean  = tr(clean_text(title))
-    first_clean  = tr(clean_text(first))
-    second_clean = tr(clean_text(second))
-    last_clean   = tr(clean_text(last))
-    keywords     = tr(extract_keywords(title_clean))
-    queries = list(set(filter(None, [
+def _sentences(text: str) -> list[str]:
+    """간단한 문장 분리(마침표/물음표/느낌표 뒤 공백 기준)"""
+    if not text:
+        return []
+    parts = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    if len(parts) <= 1:
+        parts = [s.strip() for s in re.split(r'(?<=[\.\?\!]|다\)|다]|다»|다”|다’|요\)|요]|요»|요”|요’)', text) if s.strip()]
+    return parts
+
+def _sanitize_for_query(s: str) -> str:
+    """연속 공백 정리 + 길이 컷(숫자/고유명사 보존)"""
+    s = re.sub(r'\s+', ' ', (s or '').strip())
+    return s[:MAX_QUERY_LENGTH]
+
+def _strong_phrase(s: str) -> str:
+    """정확일치 검색을 위해 따옴표 감싸기(너무 짧으면 그대로)"""
+    s = s.strip()
+    return f"\"{s}\"" if len(s) >= 8 else s
+
+def generate_search_queries(title, first, second, last, press, *, full_content: str = None):
+    """
+    제목/문장/언론사 조합 + 본문 '첫 문장부터 2~3문장'을 정확일치 쿼리
+    최종 상위 6개 반환
+    """
+    # 1) 기존 베이스 쿼리 구성
+    title_clean  = _sanitize_for_query(clean_text(title))
+    first_clean  = _sanitize_for_query(clean_text(first))
+    second_clean = _sanitize_for_query(clean_text(second))
+    last_clean   = _sanitize_for_query(clean_text(last))
+    press_clean  = _sanitize_for_query(clean_text(press))
+    keywords     = _sanitize_for_query(extract_keywords(title_clean))
+
+    base_queries = list(filter(None, [
         title_clean,
-        (keywords + " " + press).strip(),
+        (f"{keywords} {press_clean}").strip() if keywords and press_clean else "",
         first_clean, second_clean, last_clean
-    ])))
-    return queries[:5]
+    ]))
+
+    # 2) 본문 '첫 문장부터 2~3문장' 정확일치 쿼리 추가
+    head_sents_queries = []
+    if full_content:
+        full_clean = clean_text(full_content)
+        sents = _sentences(full_clean)[:3]   # 첫 2~3문장(최대 3문장)
+        for s in sents:
+            q = _sanitize_for_query(s)
+            if q:
+                head_sents_queries.append(_strong_phrase(q))
+
+    # 3) 합치기 + 중복 제거 + 간단 스코어로 상위 6개 선별
+    merged = base_queries + head_sents_queries
+
+    seen, unique = set(), []
+    for q in merged:
+        if q and q not in seen:
+            seen.add(q)
+            unique.append(q)
+
+    # 정보량 높은 쿼리를 우선(길이, 숫자 포함, 정확일치 가점)
+    def score(q: str) -> tuple:
+        has_num = int(bool(re.search(r'\d', q)))
+        is_exact = 1 if q.startswith('"') else 0
+        return (len(q), has_num, is_exact)
+
+    unique.sort(key=score, reverse=True)
+    return unique[:6]
 
 # =========================
 # 네이버 링크 OID 추출/필터
@@ -636,7 +688,8 @@ def search_naver_news_api(queries: list[str], index: int,
                     results.append({
                         "title": title,
                         "link": link,
-                        "body": clean_text(body, preserve_newline=True)
+                        "body": clean_text(body, preserve_newline=True),
+                        "query": q,
                     })
 
         except Exception as e:
