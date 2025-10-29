@@ -270,7 +270,7 @@ def run_preprocessing(
         df.apply(_has_query, axis=1)
         & (~df.get("게시글내용", "").fillna("").str.contains("신춘문예", case=False))
         & (~df.get("게시글제목", "").fillna("").str.contains("신춘문예", case=False))
-        & (~df.get("계정명", "").fillna("").str.contains("뽐뿌뉴스", case=False))
+        & (~df.get("계정명", "").fillna("").str.contains(r"(뽐뿌뉴스|몸짱기자)", case=False))
         ].copy()
 
     log(f"검색어/예외어 필터 적용: 유지 {len(df_q)}건 / 삭제 {len(df) - len(df_q)}건")
