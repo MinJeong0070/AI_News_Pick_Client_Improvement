@@ -189,6 +189,97 @@ def clean_text(text, preserve_newline=False):
     else:
         return re.sub(r"\s+", " ", text).strip()
 
+# 본문에서 URL 추출
+def extract_urls_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    # 닫는 괄호/따옴표/쉼표로 끝나는 꼬리 정리
+    urls = re.findall(r'https?://[^\s)>"\']+', text)
+    cleaned = []
+    for u in urls:
+        cleaned.append(u.rstrip('.,);\'"<>'))
+    # 단순 중복 제거
+    seen, uniq = set(), []
+    for u in cleaned:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+# 도메인 화이트리스트 로드 (재사용)
+def load_trusted_domains() -> set[str]:
+    try:
+        f = find_resource("매체사_도메인_정보.xlsx")
+        lst = _safe_read_excel(f, required_col="도메인", default_list=[])
+        return set(d.lower() for d in lst)
+    except Exception:
+        return set()
+
+# URL이 신탁 OID 또는 화이트리스트 도메인인지 판별
+def is_trusted_url(url: str, trusted_domains: set[str]) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        if "naver.com" in netloc:
+            oid = extract_oid_from_naver_url(url)
+            if not oid:
+                return False
+            if "n.news.naver.com" in netloc:
+                return oid in trusted_news_oids
+            if "sports.naver.com" in netloc:
+                return oid in trusted_sports_oids
+            if "entertain.naver.com" in netloc:
+                return oid in trusted_entertain_oids
+            return False
+        # 언론사 도메인 화이트리스트
+        return any(netloc.endswith(d) for d in trusted_domains)
+    except Exception:
+        return False
+
+# URL 1개에 대해 본문 수집 + 유사도 계산
+def evaluate_single_article_url(url: str, post_body: str, index: int = None) -> dict | None:
+    try:
+        # 먼저 requests 폴백으로 빠르게
+        body = fallback_with_requests(url)
+        if not body or len(body) < 300:
+            # 필요 시 Selenium 크롤러를 쓰는 get_news_article_body가 있으면 호출
+            try:
+                from core.core_utils_ui_api import get_news_article_body  # 있으면 사용
+                _driver = None
+                body, _driver = get_news_article_body(url, _driver, index=index)
+            except Exception:
+                pass
+
+        if not body or len(body) < 300:
+            return None
+
+        body_clean = clean_text(body, preserve_newline=True)
+        # TF-IDF 기반 복제율
+        tfidf_score = calculate_copy_ratio(body_clean, post_body)
+        # SequenceMatcher(선택: 이미 사용 중인 경우만)
+        try:
+            seq_score = calculate_sequence_matcher_ratio(body_clean, post_body)
+        except Exception:
+            seq_score = None
+        # 문장 완전(또는 hybrid) 일치율(선택)
+        try:
+            exact_rate = calculate_exact_copy_rate(body_clean, post_body)
+        except Exception:
+            exact_rate = None
+
+        return {
+            "title": "",              # (옵션) 필요 시 채워도 됨
+            "link": url,
+            "body": body_clean,
+            "query": "[blog_url]",    # ★ 블로그 내 URL로 매칭됐음을 표시
+            "tfidf": tfidf_score,
+            "sequence": seq_score,
+            "exact": exact_rate,
+        }
+    except Exception as e:
+        log(f"⚠️ 블로그 URL 평가 실패: {url} ({e})", index)
+        return None
+
+
 def extract_keywords(text, num_keywords=5):
     nouns = okt.nouns(text)
     return " ".join(nouns[:num_keywords])

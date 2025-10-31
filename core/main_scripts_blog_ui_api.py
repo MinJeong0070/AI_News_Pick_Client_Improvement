@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from core.core_utils_ui_api import (
     clean_text, extract_first_sentences, generate_search_queries,
     search_naver_news_api, calculate_copy_ratio, log, calculate_sequence_matcher_ratio
-, calculate_exact_copy_rate
+, calculate_exact_copy_rate, load_trusted_domains, extract_urls_from_text, is_trusted_url, evaluate_single_article_url
 )
 import sys
 
@@ -16,66 +16,104 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-def find_original_article_api(index, row_dict, total_count, output_dir, stop_event_flag, client_id, client_secret):
+def find_original_article_api(index, row_dict, output_dir, stop_event_flag, client_id, client_secret, driver=None):
     try:
-        # 检查中断
+        # ===== 중단 체크 =====
         if stop_event_flag:
             log("🛑 사용자 중단 요청 감지, 작업 중단", index)
             return index, "", 0.0, "", 0.0, 0.0
 
+        # ===== 입력 정리 =====
         title = clean_text(str(row_dict.get("게시글제목", "")))
         content = clean_text(str(row_dict.get("게시글내용", "")))
         press = clean_text(str(row_dict.get("검색어", "")))
+
+        # ===== 검색어 생성 =====
         first, second, last = extract_first_sentences(content)
-        queries = generate_search_queries(
-            title, first, second, last, press,
-            full_content=content
-        )
+        queries = generate_search_queries(title, first, second, last, press, full_content=content)
         log(f"🔍 검색어: {queries}", index)
 
-        # 检查中断
-        if stop_event_flag:
-            log("🛑 사용자 중단 요청 감지, 작업 중단", index)
-            return index, "", 0.0, "", 0.0, 0.0
+        # ================================
+        # 블로그 본문 URL 우선 평가
+        # ================================
+        best_from_blog = None
+        try:
+            trusted_domains = load_trusted_domains()
+            blog_urls = extract_urls_from_text(row_dict.get("게시글내용", ""))
 
+            def _score_key(c):
+                return ((c.get("sequence") or 0.0), (c.get("exact") or 0.0))
+
+            for u in blog_urls:
+                if is_trusted_url(u, trusted_domains):
+                    cand = evaluate_single_article_url(u, content, index=index)
+                    if cand is None:
+                        continue
+                    if (best_from_blog is None) or (_score_key(cand) > _score_key(best_from_blog)):
+                        best_from_blog = cand
+        except Exception as e:
+            log(f"⚠️ 블로그 URL 우선 평가 단계 예외: {e}", index)
+
+        # =====================================
+        # 네이버 뉴스 API 후보 수집
+        # =====================================
         search_results = search_naver_news_api(queries, index, client_id, client_secret)
-        if not search_results:
-            log("❌ 관련 뉴스 없음", index)
-            return index, "", 0.0, "", 0.0, 0.0
+        api_scored = []
+        if search_results:
+            for item in search_results:
+                body = item.get("body", "")
+                if not body:
+                    continue
+                seq_score = calculate_sequence_matcher_ratio(body, title + " " + content)
+                tfidf_score = calculate_copy_ratio(body, title + " " + content)
+                try:
+                    exact_rate = calculate_exact_copy_rate(body, title + " " + content, mode="hybrid")
+                except Exception:
+                    exact_rate = None
 
-        if stop_event_flag:
-            log("🛑 사용자 중단 요청 감지, 작업 중단", index)
-            return index, "", 0.0, "", 0.0, 0.0
-        '''
-        # 기존 TF-IDF 방식
-        best = max(search_results, key=lambda x: calculate_copy_ratio(x["body"], title + " " + content))
-        score = calculate_copy_ratio(best["body"], title + " " + content)
-        sequence_score = calculate_sequence_matcher_ratio(best["body"], content)
-        exact = calculate_exact_copy_rate(best["body"], title + " " + content, mode="hybrid")  # ✅ 정확복제율
-        '''
-        best = max(search_results, key=lambda x: calculate_sequence_matcher_ratio(x["body"], title + " " + content))
-        score = calculate_sequence_matcher_ratio(best["body"], title + " " + content)
-        tfidf_score = calculate_copy_ratio(best["body"], title + " " + content)
-        exact = calculate_exact_copy_rate(best["body"], title + " " + content, mode="hybrid")
-
-        # 保留换行的正文
-        body_with_newline = best["body"]
-
-        if score >= 0.0:
-            used_query = best.get("query", "")
-            safe_query = re.sub(r'[\\/*?:"<>|]', '', used_query).strip()[:100]
-            if not safe_query:
-                safe_query = "검색어 없음"
-            # safe_title = re.sub(r'[\\/*?:"<>|]', '', title)[:50]
-            filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_query}.txt")
-            with open(filename, "w", encoding="utf-8", errors="replace") as f:
-                f.write(f"[검색어] {used_query}\n[URL] {best['link']}\n\n{body_with_newline}")
-            log(f"📝 저장 완료 → {filename} (복사율: {score})", index)
-            hyperlink = f'=HYPERLINK("{best["link"]}")'
-            return index, hyperlink, tfidf_score, body_with_newline, score, exact
+                api_scored.append({
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "body": body,
+                    "query": item.get("query", ""),
+                    "tfidf": tfidf_score,
+                    "sequence": seq_score,
+                    "exact": exact_rate,
+                })
         else:
-            log(f"⚠️ 복사율 낮음 (복사율: {score})", index)
+            log("❌ 관련 뉴스 없음", index)
+
+        def score_key(c):
+            return ((c.get("sequence") or 0.0), (c.get("exact") or 0.0))
+
+        best_from_api = max(api_scored, key=score_key) if api_scored else None
+
+        # =====================================
+        # 최종 매칭
+        # =====================================
+        if best_from_blog and best_from_api:
+            final = best_from_blog if score_key(best_from_blog) >= score_key(best_from_api) else best_from_api
+        else:
+            final = best_from_blog or best_from_api
+
+        if not final:
             return index, "", 0.0, "", 0.0, 0.0
+
+        used_query = final.get("query", "")
+        tfidf_score = final.get("tfidf", 0.0)
+        sequence_score = final.get("sequence", 0.0) or 0.0
+        exact = final.get("exact", 0.0) or 0.0
+        body_with_newline = final.get("body", "")
+        hyperlink = f'=HYPERLINK("{final["link"]}")'
+
+        safe_query = re.sub(r'[\\/*?:"<>|]', '', used_query).strip()[:100] or "검색어 없음"
+        filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_query}.txt")
+        with open(filename, "w", encoding="utf-8", errors="replace") as f:
+            f.write(f"[검색어] {used_query}\n[URL] {final['link']}\n\n{body_with_newline}")
+        log(f"📝 저장 완료 → {filename} (Seq:{sequence_score:.3f}, Exact:{exact:.3f}, TF-IDF:{tfidf_score:.3f})", index)
+
+        return index, hyperlink, tfidf_score, body_with_newline, sequence_score, exact
+
     except Exception as e:
         log(f"❌ 에러 발생: {e}", index)
         return index, "", 0.0, "", 0.0, 0.0
@@ -91,30 +129,20 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
     output_dir = os.path.splitext(output_path)[0] + "_본문"
     os.makedirs(output_dir, exist_ok=True)
 
-    df = pd.read_excel(input_path, dtype={"게시글 등록일자": str})
-    total = len(df)
-    log(f"📄 전체 게시글 수: {total}개")
-
-    df["원본기사"] = ""
-    df["복사율"] = 0.0
-    df["원문내용"] = ""  # 新增列
-    df["SequenceMatcher유사도"] = 0.0  # 新增列
-
-    # 가장 큰 시트를 자동 선택
+    # 0) 가장 큰 시트를 먼저 확정
     def _load_best_sheet(path):
         xls = pd.ExcelFile(path)
-        best, n = None, -1
+        best_df, best_len = None, -1
         for s in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=s, dtype=str, keep_default_na=False, engine="openpyxl")
-            df = df.applymap(lambda x: str(x).strip().replace("\u200b", "") if pd.notna(x) else "")
-            if len(df) > n:
-                best, n = df, len(df)
-        return best
+            tmp = pd.read_excel(xls, sheet_name=s, dtype=str, keep_default_na=False, engine="openpyxl")
+            tmp = tmp.applymap(lambda x: str(x).strip().replace("\u200b", "") if pd.notna(x) else "")
+            if len(tmp) > best_len:
+                best_df, best_len = tmp, len(tmp)
+        return best_df
 
-    # 1️⃣ 가장 큰 시트 자동 선택
-    df = _load_best_sheet(input_path)
+    df = _load_best_sheet(input_path)  # ← 먼저 확정
 
-    # 2️⃣ 컬럼 표준화
+    # 1) 컬럼 표준화
     rename_map = {
         "게시물 제목": "게시글제목",
         "게시물 내용": "게시글내용",
@@ -128,16 +156,28 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
         if c not in df.columns:
             df[c] = ""
 
-    # 3️⃣ 불필요한 첫 로그 제거 후, 이 시점에 한 번만 로그 출력
-    log(f"📄 전체 게시글 수: {len(df)}")
+    # 2) 결과 컬럼 초기화(없으면 추가)
+    for col, val in [
+        ("원본기사", ""),
+        ("원문내용", ""),
+        ("복사율", 0.0),
+        ("SequenceMatcher유사도", 0.0),
+        ("정확복제율", 0.0),
+    ]:
+        if col not in df.columns:
+            df[col] = val
+
+    # 3) 로그 및 총 건수
+    total = len(df)
+    log(f"📄 전체 게시글 수: {total}")
     log(f"📑 컬럼: {list(df.columns)}")
     log(f"🔎 제목/내용 Not-blank: {((df['게시글제목'] != '') & (df['게시글내용'] != '')).sum()}행")
 
     def get_stop_flag():
         return stop_event.is_set() if stop_event else False
 
-    tasks = [(i, row.to_dict(), total, output_dir, get_stop_flag(), client_id, client_secret) for i, row in
-             df.iterrows()]
+    tasks = [(i, row.to_dict(), output_dir, get_stop_flag(), client_id, client_secret)
+             for i, row in df.iterrows()]
 
     with ProcessPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(find_original_article_api, *args) for args in tasks]
@@ -156,6 +196,7 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
                     df.at[index, "정확복제율"] = exact
                 except Exception as e:
                     log(f"❌ 결과 처리 오류: {e}")
+                    continue
 
         except Exception as e:
             log(f"❌ 프로세스 풀 에러: {e}")
