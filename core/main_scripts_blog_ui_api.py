@@ -5,8 +5,9 @@ from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from core.core_utils_ui_api import (
     clean_text, extract_first_sentences, generate_search_queries,
-    search_naver_news_api, calculate_copy_ratio, log, calculate_sequence_matcher_ratio
-, calculate_exact_copy_rate, load_trusted_domains, extract_urls_from_text, is_trusted_url, evaluate_single_article_url
+    search_naver_news_api, calculate_copy_ratio, log, calculate_sequence_matcher_ratio,
+    calculate_exact_copy_rate, load_trusted_domains, extract_urls_from_text, is_trusted_url, evaluate_single_article_url,
+    is_whitelisted_domain, is_trusted_oid, fallback_with_requests,
 )
 import sys
 
@@ -16,107 +17,147 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
-def find_original_article_api(index, row_dict, output_dir, stop_event_flag, client_id, client_secret, driver=None):
+def find_original_article_api(
+        index: int,
+        row_dict: dict,
+        output_dir: str,
+        stop_event_flag: bool,
+        client_id: str,
+        client_secret: str,
+        driver=None,
+):
     try:
-        # ===== 중단 체크 =====
-        if stop_event_flag:
-            log("🛑 사용자 중단 요청 감지, 작업 중단", index)
-            return index, "", 0.0, "", 0.0, 0.0
+        title = (row_dict.get("게시글제목") or "").strip()
+        content = (row_dict.get("게시글내용") or "").strip()
+        if not title and not content:
+            log("⚠️ 제목/본문 비어있음 → 스킵", index)
+            return index, "", 0.0, "", 0.0, 0.0, False
 
-        # ===== 입력 정리 =====
-        title = clean_text(str(row_dict.get("게시글제목", "")))
-        content = clean_text(str(row_dict.get("게시글내용", "")))
-        press = clean_text(str(row_dict.get("검색어", "")))
+        # -----------------------------
+        # (A) 블로그 본문 내 URL 1차 필터 (요청한 2단계)
+        # -----------------------------
+        inpost_urls = extract_urls_from_text(content)
+        valid_inpost_urls = [u for u in inpost_urls if is_whitelisted_domain(u) or is_trusted_oid(u)]
 
-        # ===== 검색어 생성 =====
+        # 블로그 본문에 URL이 있었는데 허용 URL이 하나도 없으면 → 행 삭제
+        if inpost_urls and not valid_inpost_urls:
+            log("🚫 블로그 내 URL 존재하지만 화이트리스트/신탁 OID 전처리 → 행 삭제", index)
+            return index, "", 0.0, "", 0.0, 0.0, True  # ← delete_row_flag=True
+
+        # 블로그 후보(본문 URL 통과분) 점수 선계산
+        # 블로그 URL 후보 (본문 URL 통과분) 점수 선계산
+        blog_candidate = None
+        if valid_inpost_urls:
+            blog_url = valid_inpost_urls[0]
+            body = fallback_with_requests(blog_url)  # ← 여기만 사용
+            if body and len(body) > 100:
+                seq = calculate_sequence_matcher_ratio(clean_text(body), clean_text(content))
+                exact = calculate_exact_copy_rate(clean_text(body), clean_text(content))
+                blog_candidate = {"link": blog_url, "body": body, "seq": seq, "exact": exact, "tfidf": 0.0,
+                                  "source": "inpost"}
+                log(f"🧷 블로그 URL 후보: {blog_url} (Seq={seq:.3f}, Exact={exact:.3f})", index)
+
+        # -----------------------------
+        # (B) 네이버 뉴스 후보 수집
+        # -----------------------------
+        title = (row_dict.get("게시글제목") or "").strip()
+        content = (row_dict.get("게시글내용") or "").strip()
+        press = (row_dict.get("검색어") or "").strip()  # ← 언론사/매체사 표준 컬럼
+
         first, second, last = extract_first_sentences(content)
-        queries = generate_search_queries(title, first, second, last, press, full_content=content)
-        log(f"🔍 검색어: {queries}", index)
 
-        # ================================
-        # 블로그 본문 URL 우선 평가
-        # ================================
-        best_from_blog = None
+        queries = generate_search_queries(
+            title, first, second, last, press, full_content=content
+        )
+        candidates = search_naver_news_api(queries=queries, index=index, client_id=client_id, client_secret=client_secret)
+
+        # 후보 본문 불러오기 + 시퀀스 점수(요청한 4단계: 필터 전에 계산)
+        enriched = []
+        for it in candidates:
+            link = it.get("link", "")
+            body = it.get("body", "")
+            if not body:
+                body = fallback_with_requests(link)
+            if not body or len(body) < 100:
+                continue
+            seq = calculate_sequence_matcher_ratio(clean_text(body), clean_text(content))
+            exact = calculate_exact_copy_rate(clean_text(body), clean_text(content))
+            tfidf = calculate_copy_ratio(clean_text(body), clean_text(content))
+            enriched.append({
+                "link": link,
+                "body": body,
+                "seq": seq,
+                "exact": exact,
+                "tfidf": tfidf,  # 필요 시 기존 TF-IDF 점수도 병기 가능
+                "source": "api",
+                "query": it.get("query", "")
+            })
+
+        if not enriched and not blog_candidate:
+            log("❌ 후보 기사 없음", index)
+            return index, "", 0.0, "", 0.0, 0.0, False
+
+        # -----------------------------
+        # (C) 후보 전체 중 1위(시퀀스 기준) 산출
+        # -----------------------------
+        pool = enriched.copy()
+        if blog_candidate:
+            pool.append(blog_candidate)
+        pool.sort(key=lambda x: (x["seq"], x["exact"]), reverse=True)
+        top_overall = pool[0]  # 시퀀스 1위
+
+        # -----------------------------
+        # (D) 1위가 비공식 매체면 → 행 삭제 (요청한 5단계 강화)
+        #     (신탁 OID X & 화이트리스트 X)
+        # -----------------------------
+        if not (is_trusted_oid(top_overall["link"]) or is_whitelisted_domain(top_overall["link"])):
+            log(f"🚫 1위가 비공식 매체 → 블로그 행 삭제: {top_overall['link']}", index)
+            return index, "", 0.0, "", 0.0, 0.0, True  # ← delete_row_flag=True
+
+        # -----------------------------
+        # (E) 공식 매체만 남기고 최종 비교
+        #     - 블로그 후보가 있으면 같이 비교
+        #     - 동일 점수면 Seq 우선, 동률이면 Exact로 타이브레이크
+        # -----------------------------
+        trusted_only = [x for x in enriched if (is_trusted_oid(x["link"]) or is_whitelisted_domain(x["link"]))]
+        if blog_candidate:
+            trusted_only.append(blog_candidate)
+        if not trusted_only:
+            log("⚠️ 공식 매체 후보 없음", index)
+            return index, "", 0.0, "", 0.0, 0.0, False
+
+        trusted_only.sort(key=lambda x: (x["seq"], x["exact"]), reverse=True)
+        best = trusted_only[0]
+
+        # ✅ 원문 기사 텍스트 저장 (검색어 기반 파일명)
         try:
-            trusted_domains = load_trusted_domains()
-            blog_urls = extract_urls_from_text(row_dict.get("게시글내용", ""))
+            used_query = best.get("query", "검색어 없음")
+            safe_query = re.sub(r'[\\/*?:"<>|]', '', used_query).strip()[:100] or "검색어 없음"
+            filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_query}.txt")
 
-            def _score_key(c):
-                return ((c.get("sequence") or 0.0), (c.get("exact") or 0.0))
+            body_with_newline = best["body"].replace('\n', '\n')
+            with open(filename, "w", encoding="utf-8", errors="replace") as f:
+                f.write(f"[검색어] {used_query}\n[URL] {best['link']}\n\n{body_with_newline}")
 
-            for u in blog_urls:
-                if is_trusted_url(u, trusted_domains):
-                    cand = evaluate_single_article_url(u, content, index=index)
-                    if cand is None:
-                        continue
-                    if (best_from_blog is None) or (_score_key(cand) > _score_key(best_from_blog)):
-                        best_from_blog = cand
+            log(f"📝 저장 완료 → {filename} "
+                f"(Seq:{best['seq']:.3f}, Exact:{best['exact']:.3f}, TF-IDF:{best.get('tfidf', 0.0):.3f})", index)
         except Exception as e:
-            log(f"⚠️ 블로그 URL 우선 평가 단계 예외: {e}", index)
+            log(f"⚠️ 기사 저장 실패: {e}", index)
 
-        # =====================================
-        # 네이버 뉴스 API 후보 수집
-        # =====================================
-        search_results = search_naver_news_api(queries, index, client_id, client_secret)
-        api_scored = []
-        if search_results:
-            for item in search_results:
-                body = item.get("body", "")
-                if not body:
-                    continue
-                seq_score = calculate_sequence_matcher_ratio(body, title + " " + content)
-                tfidf_score = calculate_copy_ratio(body, title + " " + content)
-                try:
-                    exact_rate = calculate_exact_copy_rate(body, title + " " + content, mode="hybrid")
-                except Exception:
-                    exact_rate = None
-
-                api_scored.append({
-                    "title": item.get("title", ""),
-                    "link": item.get("link", ""),
-                    "body": body,
-                    "query": item.get("query", ""),
-                    "tfidf": tfidf_score,
-                    "sequence": seq_score,
-                    "exact": exact_rate,
-                })
-        else:
-            log("❌ 관련 뉴스 없음", index)
-
-        def score_key(c):
-            return ((c.get("sequence") or 0.0), (c.get("exact") or 0.0))
-
-        best_from_api = max(api_scored, key=score_key) if api_scored else None
-
-        # =====================================
-        # 최종 매칭
-        # =====================================
-        if best_from_blog and best_from_api:
-            final = best_from_blog if score_key(best_from_blog) >= score_key(best_from_api) else best_from_api
-        else:
-            final = best_from_blog or best_from_api
-
-        if not final:
-            return index, "", 0.0, "", 0.0, 0.0
-
-        used_query = final.get("query", "")
-        tfidf_score = final.get("tfidf", 0.0)
-        sequence_score = final.get("sequence", 0.0) or 0.0
-        exact = final.get("exact", 0.0) or 0.0
-        body_with_newline = final.get("body", "")
-        hyperlink = f'=HYPERLINK("{final["link"]}")'
-
-        safe_query = re.sub(r'[\\/*?:"<>|]', '', used_query).strip()[:100] or "검색어 없음"
-        filename = os.path.join(output_dir, f"{index + 1:03d}_{safe_query}.txt")
-        with open(filename, "w", encoding="utf-8", errors="replace") as f:
-            f.write(f"[검색어] {used_query}\n[URL] {final['link']}\n\n{body_with_newline}")
-        log(f"📝 저장 완료 → {filename} (Seq:{sequence_score:.3f}, Exact:{exact:.3f}, TF-IDF:{tfidf_score:.3f})", index)
-
-        return index, hyperlink, tfidf_score, body_with_newline, sequence_score, exact
+        # 최종 리턴
+        return (
+            index,
+            best["link"],
+            best.get("tfidf", 0.0),
+            best["body"],
+            float(best["seq"]),
+            float(best["exact"]),
+            False  # delete_row_flag
+        )
 
     except Exception as e:
-        log(f"❌ 에러 발생: {e}", index)
-        return index, "", 0.0, "", 0.0, 0.0
+        log(f"❌ 결과 처리 오류: {e}", index)
+        return index, "", 0.0, "", 0.0, 0.0, False
 
 def clean_surrogates(val):
     """非法 surrogate 제거"""
@@ -158,9 +199,9 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
 
     # 2) 결과 컬럼 초기화(없으면 추가)
     for col, val in [
-        ("원본기사", ""),
+        ("원문기사 URL", ""),
         ("원문내용", ""),
-        ("복사율", 0.0),
+        ("TF-IDF", 0.0),
         ("SequenceMatcher유사도", 0.0),
         ("정확복제율", 0.0),
     ]:
@@ -188,10 +229,16 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
                     executor.shutdown(cancel_futures=True)
                     break
                 try:
-                    index, link, tfidf_score, body, sequence_score, exact = future.result()
-                    df.at[index, "원본기사"] = link
+                    index, link, tfidf_score, body, sequence_score, exact, delete_row_flag = future.result()
+
+                    if delete_row_flag:
+                        if 0 <= index < len(df):
+                            df.drop(index, inplace=True)
+                        continue
+
+                    df.at[index, "원문기사 URL"] = link
                     df.at[index, "원문내용"] = body  # 문자열(기사 본문)
-                    df.at[index, "복사율"] = tfidf_score  # 숫자(TF-IDF 유사도)
+                    df.at[index, "TF-IDF"] = tfidf_score  # 숫자(TF-IDF 유사도)
                     df.at[index, "SequenceMatcher유사도"] = sequence_score
                     df.at[index, "정확복제율"] = exact
                 except Exception as e:
@@ -201,9 +248,13 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
         except Exception as e:
             log(f"❌ 프로세스 풀 에러: {e}")
 
-    matched_count = df["복사율"].gt(0).sum()
-    above_90_count = df["복사율"].ge(0.9).sum()
-    above_50_count = df["복사율"].ge(0.5).sum() - above_90_count
+    for c in ["TF-IDF", "SequenceMatcher유사도", "정확복제율"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    matched_count = df["TF-IDF"].gt(0).sum()
+    above_90_count = df["TF-IDF"].ge(0.9).sum()
+    above_50_count = df["TF-IDF"].ge(0.5).sum() - above_90_count
     above_0_count = matched_count - above_90_count - above_50_count
 
     stats_rows = pd.DataFrame([
@@ -212,6 +263,11 @@ def main(input_path, output_path, client_id, client_secret, stop_event=None):
         {"순번": "0.9 이상", "검색": f"{above_90_count}건"},
         {"순번": "0 이상", "검색": f"{above_0_count}건"},
     ])
+
+    # '순번' 컬럼 제거
+    if "순번" in df.columns:
+        df.drop(columns=["순번"], inplace=True, errors="ignore")
+
     df = pd.concat([df, stats_rows], ignore_index=True)
 
     # surrogate 문자 제거

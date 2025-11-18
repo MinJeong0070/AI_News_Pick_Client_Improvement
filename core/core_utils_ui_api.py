@@ -191,20 +191,35 @@ def clean_text(text, preserve_newline=False):
 
 # 본문에서 URL 추출
 def extract_urls_from_text(text: str) -> list[str]:
-    if not text:
+    if not isinstance(text, str) or not text.strip():
         return []
-    # 닫는 괄호/따옴표/쉼표로 끝나는 꼬리 정리
-    urls = re.findall(r'https?://[^\s)>"\']+', text)
-    cleaned = []
-    for u in urls:
-        cleaned.append(u.rstrip('.,);\'"<>'))
-    # 단순 중복 제거
-    seen, uniq = set(), []
-    for u in cleaned:
-        if u not in seen:
-            seen.add(u)
-            uniq.append(u)
-    return uniq
+    # 간단한 URL 정규식
+    pattern = r'(https?://[^\s)>\]\"\'}]+)'
+    urls = re.findall(pattern, text)
+    # 꼬리 구두점 제거
+    return [u.rstrip(').,"\']>') for u in urls]
+
+def is_whitelisted_domain(url: str) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        return any(netloc.endswith(d) for d in trusted_domains)  # ← 이미 로딩된 화이트리스트
+    except Exception:
+        return False
+
+def is_trusted_oid(url: str) -> bool:
+    try:
+        if "naver.com" not in url:
+            return False
+        oid = extract_oid_from_naver_url(url)  # ← 기존 함수 사용
+        if not oid:
+            return False
+        return (
+            oid in trusted_news_oids or
+            oid in trusted_sports_oids or
+            oid in trusted_entertain_oids
+        )
+    except Exception:
+        return False
 
 # 도메인 화이트리스트 로드 (재사용)
 def load_trusted_domains() -> set[str]:
